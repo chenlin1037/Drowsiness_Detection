@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+yolo_py310/
+
+# 数据集与训练产物
+dataset/
+checkpoints/
+runs/
+
+# 模型权重
+*.pt
+*.onnx
+*.engine
+
+# 系统与IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
