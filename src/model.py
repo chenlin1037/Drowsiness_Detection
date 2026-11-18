@@ -123,7 +123,7 @@ class EyeStateClassifier(nn.Module):
         multi_scale=False,
         spatial_attn=False,
         film=False,
-        use_spp=False,
+        use_spp=True,
     ):
         super().__init__()
 

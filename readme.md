@@ -85,18 +85,19 @@ dataset/mrl_split/
   （glasses / reflection / lighting 等条件属性，即文件名第 4/6/7 字段等）；
 - **输出**：单个二分类 logit，配合 `BCEWithLogitsLoss`，判决阈值 `logits >= 0`。
 
-为支持任意输入分辨率，模型提供 **SPP 空间金字塔池化**（`--spp`）：
+为支持任意输入分辨率，模型默认启用 **SPP 空间金字塔池化**（SPP-Net 风格）：
 对 layer4 特征图按 1/2/4 三组 bin 做自适应平均池化并拼接
 （512×(1+4+16)=10752 维），特征维度与输入尺寸无关，`--img-size`
-可取任意 ≥32 的值（默认路径为单一 GAP，仅 512 维）。
+可取任意 ≥32 的值。可用 `--no-spp` 关闭，回退为单一 GAP（512 维），
+以便加载或训练 GAP 结构的旧版 checkpoint。
 
 以下模块为消融实验能力，默认关闭，通过开关启用：
 
 | 开关 | 模块 | 说明 |
 | --- | --- | --- |
-| `--spp` | SpatialPyramidPool | 空间金字塔池化，支持任意输入尺寸 |
+| `--no-spp` | SpatialPyramidPool | 关闭默认启用的空间金字塔池化，回退 GAP |
 | `--se` | SEBlock | SE 通道注意力，插在 layer3/layer4 之后 |
-| `--multi-scale` | — | layer2/3/4 GAP 拼接（896 维），与 `--spp` 互斥 |
+| `--multi-scale` | — | layer2/3/4 GAP 拼接（896 维），需配合 `--no-spp` |
 | `--spatial-attn` | SpatialGate | CBAM 风格空间门控（近恒等初始化） |
 | `--film` | FiLMGenerator | metadata 深度注入调制特征（已被消融证伪） |
 | `--no-metadata` | — | 分类头不拼接 metadata（消融对照） |

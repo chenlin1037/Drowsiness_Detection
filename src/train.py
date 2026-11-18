@@ -174,9 +174,10 @@ def parse_args() -> argparse.Namespace:
         help="启用多尺度特征融合(layer2/3/4 GAP 拼接,896 维)",
     )
     parser.add_argument(
-        "--spp",
-        action="store_true",
-        help="启用 SPP 空间金字塔池化(1/2/4 bin,10752 维;支持任意输入分辨率),与 --multi-scale 互斥",
+        "--no-spp",
+        action="store_false",
+        dest="spp",
+        help="关闭 SPP 空间金字塔池化,回退为单一 GAP(512 维);默认启用 SPP(1/2/4 bin,10752 维,支持任意输入分辨率)",
     )
     ## 消融实验开关:不加 metadata 拼接
     parser.add_argument(
