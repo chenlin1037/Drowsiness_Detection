@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from dataset import EyeStateDataset
 from evaluate import evaluate
@@ -51,6 +51,26 @@ def resolve_augment(args: argparse.Namespace) -> dict[str, float] | None:
     return resolved or None
 
 
+def next_csv_path(runs_dir: Path, name: str) -> Path:
+    """同名训练自动版本化: {name}.csv -> {name}-1.csv -> {name}-2.csv ..."""
+    path = runs_dir / f"{name}-result.csv"
+    suffix = 1
+    while path.exists():
+        path = runs_dir / f"{name}-result-{suffix}.csv"
+        suffix += 1
+    return path
+
+
+def next_ckpt_dir(runs_dir: Path) -> Path:
+    """checkpoint 目录自动版本化: checkpoints -> checkpoints-1 -> checkpoints-2 ..."""
+    directory = runs_dir / "checkpoints"
+    suffix = 1
+    while directory.exists():
+        directory = runs_dir / f"checkpoints-{suffix}"
+        suffix += 1
+    return directory
+
+
 
 
 def train_one_epoch(
@@ -60,6 +80,7 @@ def train_one_epoch(
     device: torch.device,
     optimizer: torch.optim.Optimizer,
     progress: ProgressBar | None = None,
+    label_smoothing: float = 0.0,
 ) -> dict[str, float]:
     model.train()
     total_loss = 0.0
@@ -77,7 +98,11 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
         logits = model(images, metadata).squeeze(1)
-        loss = criterion(logits, labels)
+        loss_labels = labels
+        if label_smoothing > 0:
+            # 0/1 标签 -> eps/2 / 1-eps/2
+            loss_labels = labels * (1.0 - label_smoothing) + 0.5 * label_smoothing
+        loss = criterion(logits, loss_labels)
         loss.backward()
         optimizer.step()
 
@@ -122,8 +147,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=PROJECT_ROOT / "runs" / "checkpoints" / "best.pt",
-        help="Path for the best validation checkpoint",
+        default=None,
+        help="Path for the best validation checkpoint (默认按 name 自动版本化到 runs/checkpoints[-N]/best.pt)",
     )
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -131,6 +156,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=20261105)
+    ## 网络架构开关
+    parser.add_argument(
+        "--img-size",
+        type=int,
+        default=74,
+        help="输入图像分辨率(默认 74,建议 112 配合 SE/多尺度)",
+    )
+    parser.add_argument(
+        "--se",
+        action="store_true",
+        help="启用 SE 通道注意力(插在 layer3/layer4 之后)",
+    )
+    parser.add_argument(
+        "--multi-scale",
+        action="store_true",
+        help="启用多尺度特征融合(layer2/3/4 GAP 拼接,896 维)",
+    )
+    ## 消融实验开关:不加 metadata 拼接
+    parser.add_argument(
+        "--no-metadata",
+        action="store_true",
+        help="消融实验:分类头不拼接 9 维 metadata 特征(默认拼接)",
+    )
+    ## 额外训练配置
+    parser.add_argument(
+        "--label-smoothing",
+        type=float,
+        default=0.0,
+        help="标签平滑系数(0 关闭,常用 0.05~0.1)",
+    )
+    parser.add_argument(
+        "--cosine",
+        action="store_true",
+        help="使用 cosine 退火学习率调度(按 epoch 衰减到 0)",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=0,
+        help="早停耐心值:val_loss 连续 N 轮无改善则停止(0 关闭)",
+    )
     ## 数据增强参数(参考 YOLO;未指定 --augment 且未单独设置时不增强)
     parser.add_argument(
         "--augment",
@@ -146,6 +212,49 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shear", type=float, default=None, help="随机剪切角度")
     parser.add_argument("--flipud", type=float, default=None, help="上下翻转概率")
     parser.add_argument("--fliplr", type=float, default=None, help="左右翻转概率")
+    parser.add_argument(
+        "--targeted-augment",
+        action="store_true",
+        help="追加针对性增强(暗光/模糊/反光,错样归因驱动);需与 --augment 同时使用,仅作用于训练集",
+    )
+    parser.add_argument(
+        "--glint-only",
+        action="store_true",
+        help="targeted-augment 子集开关:只保留反光斑变换,去掉已证伪的暗光/模糊;需与 --targeted-augment 同时使用",
+    )
+    parser.add_argument(
+        "--spatial-attn",
+        action="store_true",
+        help="在 layer2/layer3 后插入 CBAM 风格空间门控(近恒等初始化)",
+    )
+    parser.add_argument(
+        "--film",
+        action="store_true",
+        help="用 FiLM 将 metadata 注入 layer3/layer4 特征(逐通道仿射调制,恒等初始化);需含 metadata",
+    )
+    parser.add_argument(
+        "--weighted-sampling",
+        action="store_true",
+        help="按困难条件(glasses=1/reflection=2/lighting=0)对训练集加权过采样",
+    )
+    parser.add_argument(
+        "--oversample-weight",
+        type=float,
+        default=0.5,
+        help="加权过采样中每个困难条件的附加权重(默认 0.5,即三条件全中 2.5x)",
+    )
+    parser.add_argument(
+        "--soft-label-csv",
+        type=str,
+        default=None,
+        help="可疑标签 CSV(detect_label_noise.py 输出),命中的样本用软标签训练",
+    )
+    parser.add_argument(
+        "--soft-label-value",
+        type=float,
+        default=0.2,
+        help="软标签软化值 v: 标签 1 重写为 1-v、0 重写为 v,默认 0.2 即 1->0.8 / 0->0.2",
+    )
     parser.add_argument(
         "--no-pretrained",
         action="store_false",
@@ -168,6 +277,22 @@ def parse_args() -> argparse.Namespace:
         parser.error("--weight-decay cannot be negative")
     if args.num_workers < 0:
         parser.error("--num-workers cannot be negative")
+    if not 0 <= args.label_smoothing < 1:
+        parser.error("--label-smoothing must be in [0, 1)")
+    if args.patience < 0:
+        parser.error("--patience cannot be negative")
+    if args.img_size < 32:
+        parser.error("--img-size must be at least 32")
+    if args.targeted_augment and not args.augment:
+        parser.error("--targeted-augment 需要与 --augment 同时使用")
+    if args.glint_only and not args.targeted_augment:
+        parser.error("--glint-only 需要与 --targeted-augment 同时使用")
+    if args.film and args.no_metadata:
+        parser.error("--film 需要 metadata 输入(不能与 --no-metadata 同时使用)")
+    if not 0 < args.oversample_weight <= 2:
+        parser.error("--oversample-weight must be in (0, 2]")
+    if not 0 < args.soft_label_value < 1:
+        parser.error("--soft-label-value must be in (0, 1)")
     return args
 
 
@@ -182,31 +307,107 @@ def main() -> None:
     augment_params = resolve_augment(args)
     if augment_params:
         print("Augmentation enabled: " + ", ".join(f"{k}={v}" for k, v in augment_params.items()))
-    train_dataset = EyeStateDataset(args.data_dir / "train", args.data_dir / "train.csv", augment=augment_params)
-    val_dataset = EyeStateDataset(args.data_dir / "val", args.data_dir / "val.csv")
+    if args.targeted_augment:
+        if args.glint_only:
+            print("Targeted augmentation enabled: glint only(p=0.3), train only")
+        else:
+            print("Targeted augmentation enabled: low-light(p=0.5) + blur(p=0.3) + glint(p=0.3), train only")
+    print(
+        "Architecture: "
+        + ", ".join([
+            f"img_size={args.img_size}",
+            f"se={args.se}",
+            f"multi_scale={args.multi_scale}",
+            f"metadata={not args.no_metadata}",
+        ])
+    )
+    soft_labels = None
+    if args.soft_label_csv:
+        soft_csv = Path(args.soft_label_csv)
+        if not soft_csv.is_file():
+            raise SystemExit(f"--soft-label-csv 文件不存在: {soft_csv}")
+        soft_labels = {}
+        with soft_csv.open(newline="", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                hard = float(r["label"])
+                soft_labels[Path(r["image_path"]).name] = (
+                    1.0 - args.soft_label_value if hard >= 0.5 else args.soft_label_value
+                )
+        print(
+            f"Soft labels enabled: {len(soft_labels)} samples from {soft_csv} "
+            f"(1.0->{1.0 - args.soft_label_value:.2f}, 0.0->{args.soft_label_value:.2f})"
+        )
+
+    train_dataset = EyeStateDataset(
+        args.data_dir / "train", args.data_dir / "train.csv",
+        augment=augment_params, image_size=args.img_size,
+        targeted_augment=args.targeted_augment, glint_only=args.glint_only,
+        soft_labels=soft_labels,
+    )
+    val_dataset = EyeStateDataset(
+        args.data_dir / "val", args.data_dir / "val.csv",
+        image_size=args.img_size,
+    )
     loader_options = {
         "batch_size": args.batch_size,
         "num_workers": args.num_workers,
         "pin_memory": device.type == "cuda",
         "persistent_workers": args.num_workers > 0,
     }
-    train_loader = DataLoader(train_dataset, shuffle=True, **loader_options)
+    train_loader = None
+    if args.weighted_sampling:
+        weights = torch.tensor(train_dataset.condition_weights(args.oversample_weight))
+        sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+        train_loader = DataLoader(train_dataset, sampler=sampler, **loader_options)
+        print(
+            "Weighted sampling enabled: "
+            f"per-condition=+{args.oversample_weight}, "
+            f"effective epoch size={weights.sum().item() / len(weights):.2f}x"
+        )
+    else:
+        train_loader = DataLoader(train_dataset, shuffle=True, **loader_options)
     val_loader = DataLoader(val_dataset, shuffle=False, **loader_options)
 
-    model = EyeStateClassifier(pretrained=args.pretrained).to(device)
+    model = EyeStateClassifier(
+        pretrained=args.pretrained,
+        use_metadata=not args.no_metadata,
+        use_se=args.se,
+        multi_scale=args.multi_scale,
+        spatial_attn=args.spatial_attn,
+        film=args.film,
+    ).to(device)
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+        if args.cosine else None
+    )
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
+    # 同名训练自动版本化: results.csv -> results-1.csv, checkpoints -> checkpoints-1
+    runs_dir = PROJECT_ROOT / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = next_csv_path(runs_dir, args.name)
+    output_path = args.output if args.output is not None else next_ckpt_dir(runs_dir) / "best.pt"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    csv_file = csv_path.open("w", newline="")
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(
+        ["epoch", "train_loss", "train_accuracy", "train_precision", "train_recall", "train_f1",
+         "val_loss", "val_accuracy", "val_precision", "val_recall", "val_f1"]
+    )
+
     best_val_loss = float("inf")
+    epochs_without_improvement = 0
     print(
         f"Device: {device}; train images: {len(train_dataset)}; "
         f"validation images: {len(val_dataset)}"
     )
+    print(f"Metrics csv: {csv_path}")
+    print(f"Checkpoint : {output_path}")
 
     for epoch in range(1, args.epochs + 1):
         gpu_mem = ""
@@ -217,7 +418,10 @@ def main() -> None:
         # YOLO 风格表头与进度条
         print(f"{'Epoch':>10}{'GPU_mem':>10}{'loss':>12}{'Instances':>12}{'Size':>8}")
         train_bar = ProgressBar(len(train_loader), desc=f"{epoch:>6}/{args.epochs}")
-        train_metrics = train_one_epoch(model, train_loader, criterion, device, optimizer, train_bar)
+        train_metrics = train_one_epoch(
+            model, train_loader, criterion, device, optimizer, train_bar,
+            label_smoothing=args.label_smoothing,
+        )
         train_bar.close()
 
         print(f"{'':>10}{'Class':>10}{'Images':>10}{'Loss':>12}{'Acc':>9}{'P':>9}{'R':>9}{'F1':>9}")
@@ -246,19 +450,16 @@ def main() -> None:
         val_recall = val_metrics["recall"]
         val_f1 = val_metrics["f1"]
         
-        # 放进csv文件中,使用训练名称,存放在runs文件夹中
-        runs_dir = PROJECT_ROOT / "runs"
-        runs_dir.mkdir(parents=True, exist_ok=True)
-        with open(runs_dir /"results.csv", "a", newline="") as f:
-            writer = csv.writer(f)
-            # 表头
-            if f.tell() == 0:
-                writer.writerow(["epoch", "train_loss", "train_accuracy", "train_precision", "train_recall", "train_f1", "val_loss", "val_accuracy", "val_precision", "val_recall", "val_f1"])
-            writer.writerow([epoch, train_loss, train_accuracy, train_precision, train_recall, train_f1, val_loss, val_accuracy, val_precision, val_recall, val_f1])
-            print(f"Epoch {epoch}: train_loss={train_loss:.4f}, train_accuracy={train_accuracy:.4f}, train_precision={train_precision:.4f}, train_recall={train_recall:.4f}, train_f1={train_f1:.4f}, val_loss={val_loss:.4f}, val_accuracy={val_accuracy:.4f}, val_precision={val_precision:.4f}, val_recall={val_recall:.4f}, val_f1={val_f1:.4f}")
+        # 每轮追加写入版本化的 csv
+        csv_writer.writerow(
+            [epoch, train_loss, train_accuracy, train_precision, train_recall, train_f1,
+             val_loss, val_accuracy, val_precision, val_recall, val_f1]
+        )
+        csv_file.flush()
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            epochs_without_improvement = 0
             torch.save(
                 {
                     "epoch": epoch,
@@ -266,10 +467,29 @@ def main() -> None:
                     "optimizer_state_dict": optimizer.state_dict(),
                     "val_loss": val_loss,
                     "val_accuracy": val_accuracy,
+                    "use_metadata": not args.no_metadata,
+                    "use_se": args.se,
+                    "multi_scale": args.multi_scale,
+                    "spatial_attn": args.spatial_attn,
+                    "film": args.film,
+                    "image_size": args.img_size,
                 },
-                args.output,
+                output_path,
             )
-            # print(f"Saved best checkpoint to {args.output}")
+        else:
+            epochs_without_improvement += 1
+            if args.patience > 0 and epochs_without_improvement >= args.patience:
+                print(
+                    f"Early stopping: val_loss has not improved for "
+                    f"{epochs_without_improvement} epochs (best {best_val_loss:.4f})"
+                )
+                break
+
+        if scheduler is not None:
+            scheduler.step()
+
+    csv_file.close()
+    print(f"Training finished. Metrics: {csv_path}; best checkpoint: {output_path}")
 
 
 if __name__ == "__main__":

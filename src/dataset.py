@@ -1,8 +1,9 @@
 import csv
+import random
 from pathlib import Path
 
 import torch
-from PIL import Image
+from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter
 from torch.utils.data import Dataset
 from torchvision import transforms
 
@@ -21,12 +22,89 @@ REQUIRED_COLUMNS = ("image_path", "subject_id", *ALLOWED_VALUES)
 AUGMENT_KEYS = ("hsv_s", "hsv_v", "degrees", "translate", "scale", "shear", "flipud", "fliplr")
 
 
-def build_transform(augment: dict[str, float] | None = None) -> transforms.Compose:
+class RandomLowLight:
+    """随机伽马压暗 + 对比度衰减,模拟弱光(lighting=0)条件。"""
+
+    def __init__(
+        self,
+        p: float = 0.5,
+        gamma_range: tuple[float, float] = (0.45, 0.85),
+        contrast_range: tuple[float, float] = (0.7, 0.95),
+    ):
+        self.p = p
+        self.gamma_range = gamma_range
+        self.contrast_range = contrast_range
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+        gamma = random.uniform(*self.gamma_range)
+        img = img.point(lambda v: int(255.0 * (v / 255.0) ** gamma))
+        return ImageEnhance.Contrast(img).enhance(random.uniform(*self.contrast_range))
+
+
+class RandomBlur:
+    """轻微高斯/运动模糊,模拟低照度下的运动模糊帧。"""
+
+    def __init__(self, p: float = 0.3, radius_range: tuple[float, float] = (0.4, 1.2)):
+        self.p = p
+        self.radius_range = radius_range
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+        if random.random() < 0.5:  # 对角方向运动模糊
+            kernel = random.choice(
+                ([1, 0, 0, 0, 2, 0, 0, 0, 1], [0, 0, 1, 0, 2, 0, 1, 0, 0])
+            )
+            return img.filter(ImageFilter.Kernel((3, 3), kernel, scale=3))
+        return img.filter(ImageFilter.GaussianBlur(random.uniform(*self.radius_range)))
+
+
+class RandomGlint:
+    """随机叠加小高光斑,模拟镜片反光点(reflection=2)。"""
+
+    def __init__(
+        self,
+        p: float = 0.3,
+        radius_range: tuple[float, float] = (2.0, 5.0),
+        value_range: tuple[int, int] = (180, 255),
+    ):
+        self.p = p
+        self.radius_range = radius_range
+        self.value_range = value_range
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+        w, h = img.size
+        overlay = Image.new("L", img.size, 0)
+        draw = ImageDraw.Draw(overlay)
+        for _ in range(random.randint(1, 2)):
+            cx = random.uniform(w * 0.2, w * 0.8)
+            cy = random.uniform(h * 0.2, h * 0.8)
+            r = random.uniform(*self.radius_range)
+            draw.ellipse(
+                (cx - r, cy - r, cx + r, cy + r),
+                fill=random.randint(*self.value_range),
+            )
+        overlay = overlay.filter(ImageFilter.GaussianBlur(1))
+        return ImageChops.screen(img, overlay)
+
+
+def build_transform(
+    augment: dict[str, float] | None = None,
+    image_size: int = IMAGE_SIZE,
+    targeted_augment: bool = False,
+    glint_only: bool = False,
+) -> transforms.Compose:
     """Build the image transform; enable YOLO-style augmentation when given.
 
     灰度图下 hsv_h 无意义被忽略;hsv_s 映射为对比度抖动,hsv_v 映射为亮度抖动。
+    targeted_augment: 追加暗光/模糊/反光三种针对性变换(错样归因驱动,仅训练集使用)。
+    glint_only: targeted_augment 的子集开关,只保留反光斑变换(暗光/模糊已被消融证伪)。
     """
-    ops: list = [transforms.Resize((IMAGE_SIZE, IMAGE_SIZE))]
+    ops: list = [transforms.Resize((image_size, image_size))]
     if augment:
         degrees = float(augment.get("degrees", 0.0) or 0.0)
         translate = float(augment.get("translate", 0.0) or 0.0)
@@ -48,6 +126,11 @@ def build_transform(augment: dict[str, float] | None = None) -> transforms.Compo
             jitter["contrast"] = float(augment["hsv_s"])
         if jitter:
             ops.append(transforms.ColorJitter(**jitter))
+        if targeted_augment:
+            if glint_only:
+                ops.append(RandomGlint())
+            else:
+                ops.extend([RandomLowLight(), RandomBlur(), RandomGlint()])
         if float(augment.get("fliplr", 0.0) or 0.0):
             ops.append(transforms.RandomHorizontalFlip(p=float(augment["fliplr"])))
         if float(augment.get("flipud", 0.0) or 0.0):
@@ -74,9 +157,13 @@ class EyeStateDataset(Dataset):
         split_dir: Path,
         csv_path: Path,
         augment: dict[str, float] | None = None,
+        image_size: int = IMAGE_SIZE,
+        targeted_augment: bool = False,
+        glint_only: bool = False,
+        soft_labels: dict[str, float] | None = None,
     ) -> None:
         self.split_dir = split_dir
-        self.transform = build_transform(augment)
+        self.transform = build_transform(augment, image_size, targeted_augment, glint_only)
 
         if not split_dir.is_dir():
             raise FileNotFoundError(f"Dataset split directory not found: {split_dir}")
@@ -124,11 +211,38 @@ class EyeStateDataset(Dataset):
                 float(row["sensor"] == category)
                 for category in ALLOWED_VALUES["sensor"]
             )
-            self.samples.append((image_path, metadata, float(row["eye_state"])))
+            # 软标签覆盖:按文件名命中可疑标签表,仅在训练集使用
+            label = float(row["eye_state"])
+            if soft_labels is not None:
+                label = soft_labels.get(Path(image_key).name, label)
+            self.samples.append((image_path, metadata, label))
             self.image_keys.append(image_key)
 
     def __len__(self) -> int:
         return len(self.samples)
+
+    def condition_weights(
+        self,
+        per_condition: float = 0.5,
+    ) -> list[float]:
+        """按 metadata 困难条件计算过采样权重(错样归因驱动)。
+
+        对 glasses=1 / reflection=2 / lighting=0 三个困难条件各加 per_condition 权重,
+        同时命中多个条件的样本(如 test 上错误率最高的三条件联合)获得最高权重。
+        metadata 布局: [sex, glasses, refl==0, refl==1, refl==2, lighting, sen01, sen02, sen03]
+        """
+        weights = []
+        for _, metadata, _ in self.samples:
+            w = 1.0
+            if metadata[1] == 1.0:
+                w += per_condition
+            if metadata[4] == 1.0:
+                w += per_condition
+            if metadata[5] == 1.0:
+                w += per_condition
+            weights.append(w)
+        return weights
+
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         image_path, metadata, label = self.samples[index]

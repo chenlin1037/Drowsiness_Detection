@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from dataset import EyeStateDataset
-from model import EyeStateClassifier
+from model import EyeStateClassifier, adapt_state_dict
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=project_root / "checkpoints" / "eye_state_classifier.pt",
+        default=project_root / "runs" / "checkpoints" / "best.pt",
     )
     parser.add_argument(
         "--output",
@@ -51,13 +51,24 @@ def main() -> None:
     if not args.csv.is_file():
         raise FileNotFoundError(f"Split CSV not found: {args.csv}")
 
-    dataset = EyeStateDataset(args.data_dir, args.csv)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
+
+    dataset = EyeStateDataset(
+        args.data_dir,
+        args.csv,
+        image_size=checkpoint.get("image_size", 74),
+    )
     state_dict = checkpoint.get("model_state_dict", checkpoint)
-    model = EyeStateClassifier(pretrained=False).to(device)
-    model.load_state_dict(state_dict)
+    model = EyeStateClassifier(
+        pretrained=False,
+        use_metadata=checkpoint.get("use_metadata", True),
+        use_se=checkpoint.get("use_se", False),
+        multi_scale=checkpoint.get("multi_scale", False),
+        spatial_attn=checkpoint.get("spatial_attn", False),
+        film=checkpoint.get("film", False),
+    ).to(device)
+    model.load_state_dict(adapt_state_dict(state_dict))
     model.eval()
 
     loader = DataLoader(
