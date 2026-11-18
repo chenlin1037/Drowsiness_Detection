@@ -173,6 +173,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="启用多尺度特征融合(layer2/3/4 GAP 拼接,896 维)",
     )
+    parser.add_argument(
+        "--spp",
+        action="store_true",
+        help="启用 SPP 空间金字塔池化(1/2/4 bin,10752 维;支持任意输入分辨率),与 --multi-scale 互斥",
+    )
     ## 消融实验开关:不加 metadata 拼接
     parser.add_argument(
         "--no-metadata",
@@ -289,6 +294,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--glint-only 需要与 --targeted-augment 同时使用")
     if args.film and args.no_metadata:
         parser.error("--film 需要 metadata 输入(不能与 --no-metadata 同时使用)")
+    if args.spp and args.multi_scale:
+        parser.error("--spp 与 --multi-scale 互斥(SPP 直接作用于 layer4 输出)")
     if not 0 < args.oversample_weight <= 2:
         parser.error("--oversample-weight must be in (0, 2]")
     if not 0 < args.soft_label_value < 1:
@@ -318,6 +325,7 @@ def main() -> None:
             f"img_size={args.img_size}",
             f"se={args.se}",
             f"multi_scale={args.multi_scale}",
+            f"spp={args.spp}",
             f"metadata={not args.no_metadata}",
         ])
     )
@@ -375,6 +383,7 @@ def main() -> None:
         multi_scale=args.multi_scale,
         spatial_attn=args.spatial_attn,
         film=args.film,
+        use_spp=args.spp,
     ).to(device)
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.AdamW(
@@ -472,6 +481,7 @@ def main() -> None:
                     "multi_scale": args.multi_scale,
                     "spatial_attn": args.spatial_attn,
                     "film": args.film,
+                    "spp": args.spp,
                     "image_size": args.img_size,
                 },
                 output_path,

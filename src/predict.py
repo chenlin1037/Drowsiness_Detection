@@ -67,6 +67,7 @@ def main() -> None:
         multi_scale=checkpoint.get("multi_scale", False),
         spatial_attn=checkpoint.get("spatial_attn", False),
         film=checkpoint.get("film", False),
+        use_spp=checkpoint.get("spp", False),
     ).to(device)
     model.load_state_dict(adapt_state_dict(state_dict))
     model.eval()

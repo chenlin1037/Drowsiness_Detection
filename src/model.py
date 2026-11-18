@@ -94,6 +94,26 @@ class FiLMGenerator(nn.Module):
         return x * gamma + beta
 
 
+class SpatialPyramidPool(nn.Module):
+    """SPP-Net 风格空间金字塔池化(He et al. 2015)。
+
+    对最后一层特征图按多组 bin(默认 1/2/4)做自适应平均池化后拼接,
+    输出维度与输入分辨率无关,因此网络可接受任意尺寸输入。
+    """
+
+    def __init__(self, channels: int, levels: tuple[int, ...] = (1, 2, 4)):
+        super().__init__()
+        self.levels = levels
+        self.output_dim = channels * sum(k * k for k in levels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        pooled = [
+            torch.flatten(nn.functional.adaptive_avg_pool2d(x, (k, k)), 1)
+            for k in self.levels
+        ]
+        return torch.cat(pooled, dim=1)
+
+
 class EyeStateClassifier(nn.Module):
     def __init__(
         self,
@@ -103,6 +123,7 @@ class EyeStateClassifier(nn.Module):
         multi_scale=False,
         spatial_attn=False,
         film=False,
+        use_spp=False,
     ):
         super().__init__()
 
@@ -111,6 +132,7 @@ class EyeStateClassifier(nn.Module):
         self.multi_scale = multi_scale
         self.spatial_attn = spatial_attn
         self.film = film and use_metadata
+        self.use_spp = use_spp
 
         # 1. 加载 ResNet34 预训练模型
         weights = (
@@ -164,8 +186,12 @@ class EyeStateClassifier(nn.Module):
             self.film3 = FiLMGenerator(metadata_dim, 256)
             self.film4 = FiLMGenerator(metadata_dim, 512)
 
-        # 5. 特征维度: 多尺度融合取 layer2/3/4 的 GAP 拼接
-        self.feature_dim = 128 + 256 + 512 if multi_scale else 512
+        # 5. 特征维度: SPP 优先(512×(1+4+16)=10752);多尺度融合取 layer2/3/4 的 GAP 拼接
+        if use_spp:
+            self.spp = SpatialPyramidPool(512)
+            self.feature_dim = self.spp.output_dim
+        else:
+            self.feature_dim = 128 + 256 + 512 if multi_scale else 512
 
         # 6. 图像和辅助特征维度
         metadata_dim = 9 if use_metadata else 0
@@ -205,7 +231,10 @@ class EyeStateClassifier(nn.Module):
         if self.film:
             f4 = self.film4(f4, metadata)
 
-        if self.multi_scale:
+        if self.use_spp:
+            # SPP: 多组 bin 的空间金字塔池化,支持任意输入分辨率
+            image_features = self.spp(f4)
+        elif self.multi_scale:
             # 多尺度 GAP 拼接: 128 + 256 + 512 = 896
             pooled = [
                 torch.flatten(nn.functional.adaptive_avg_pool2d(t, 1), 1)
