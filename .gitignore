@@ -6,7 +6,13 @@ __pycache__/
 yolo_py310/
 
 # 数据集与训练产物
-dataset/
+# 图片不入库;仅放行 mrl_split 的划分清单(CSV/JSON)以保证划分可复现
+dataset/**
+!dataset/mrl_split
+dataset/mrl_split/**
+!dataset/mrl_split/*.csv
+!dataset/mrl_split/*.json
+dataset/mrl_split/test_predictions.csv
 checkpoints/
 runs/
 
